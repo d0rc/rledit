@@ -105,8 +105,11 @@ class RLTrainer:
             epoch_reward = 0.0
             num_batches = 0
             
+            # Create tqdm progress bar before the loop
+            progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch + 1}/{num_epochs}")
+            
             # Process each batch
-            for batch in tqdm(train_dataloader, desc=f"Epoch {epoch + 1}/{num_epochs}"):
+            for batch in progress_bar:
                 # Extract the batch data
                 original_texts = batch["original_texts"]
                 
@@ -147,9 +150,15 @@ class RLTrainer:
                 self.optimizer.step()
                 self.scheduler.step()
                 
+                # Calculate batch reward
+                batch_reward = sum(rewards) / len(rewards)
+                
+                # Update progress bar with current loss and reward
+                progress_bar.set_postfix(loss=f"{rl_loss.item():.4f}", reward=f"{batch_reward:.4f}", refresh=True)
+                
                 # Update statistics
                 epoch_loss += rl_loss.item()
-                epoch_reward += sum(rewards) / len(rewards)
+                epoch_reward += batch_reward
                 num_batches += 1
                 self.global_step += 1
                 
@@ -306,6 +315,12 @@ class RLTrainer:
         
         # Normalize the loss
         loss /= len(rewards)
+        
+        # Ensure loss is a tensor with requires_grad=True
+        if not isinstance(loss, torch.Tensor):
+            # If loss is still a float (e.g., when no operations were performed),
+            # convert it to a zero tensor with requires_grad=True
+            loss = torch.zeros(1, device=self.device, requires_grad=True)
         
         return loss
     

@@ -242,7 +242,7 @@ class BERTEditor(PreTrainedModel):
         encoder_outputs = self.encoder(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
+            #token_type_ids=token_type_ids,
         )
         
         # Get the hidden states
