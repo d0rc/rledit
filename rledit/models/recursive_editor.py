@@ -20,7 +20,7 @@ class RecursiveEditor:
     to input text until convergence or maximum iterations.
     """
     
-    def __init__(self, editor_model, tokenizer, max_iterations=5, convergence_threshold=0.95):
+    def __init__(self, editor_model, tokenizer, max_iterations=5, convergence_threshold=0.95, cache_size=1000):
         """
         Initialize the recursive editor.
         
@@ -29,11 +29,109 @@ class RecursiveEditor:
             tokenizer: The tokenizer
             max_iterations: Maximum number of iterations
             convergence_threshold: Threshold for convergence (fraction of KEEP operations)
+            cache_size: Maximum number of entries in the tokenization cache
         """
         self.editor_model = editor_model
         self.tokenizer = tokenizer
         self.max_iterations = max_iterations
         self.convergence_threshold = convergence_threshold
+        self.token_cache = {}
+        self.cache_size = cache_size
+        self.cache_hits = 0
+        self.cache_misses = 0
+    
+    def _cached_tokenize(self, texts, **kwargs):
+        """
+        Tokenize texts with caching.
+        
+        Args:
+            texts: List of input texts
+            **kwargs: Additional arguments for the tokenizer
+            
+        Returns:
+            inputs: Tokenized inputs
+        """
+        batch_size = len(texts)
+        cache_keys = []
+        cached_results = []
+        texts_to_tokenize = []
+        indices_to_tokenize = []
+        
+        # Check cache for each text
+        for i, text in enumerate(texts):
+            cache_key = (text, frozenset(kwargs.items()))
+            cache_keys.append(cache_key)
+            
+            if cache_key in self.token_cache:
+                # Cache hit
+                cached_results.append(self.token_cache[cache_key])
+                self.cache_hits += 1
+            else:
+                # Cache miss
+                texts_to_tokenize.append(text)
+                indices_to_tokenize.append(i)
+                self.cache_misses += 1
+        
+        # If all texts were in cache, combine and return
+        if not texts_to_tokenize:
+            return self._combine_tokenized_inputs(cached_results, batch_size)
+        
+        # Tokenize texts not in cache
+        tokenized_inputs = self.tokenizer(
+            texts_to_tokenize,
+            return_tensors="pt",
+            padding=True,
+            **kwargs
+        ).to(self.editor_model.device)
+        
+        # Store in cache
+        for i, idx in enumerate(indices_to_tokenize):
+            # For single-item batches, need to ensure we get a proper subset
+            if len(texts_to_tokenize) == 1:
+                single_input = {k: v for k, v in tokenized_inputs.items()}
+            else:
+                # Select the specific item from the batch
+                single_input = {
+                    k: v[i:i+1] for k, v in tokenized_inputs.items()
+                }
+            
+            # Cache the result
+            self.token_cache[cache_keys[idx]] = single_input
+            cached_results.append(single_input)
+            
+            # Manage cache size
+            if len(self.token_cache) > self.cache_size:
+                # Simple LRU-like behavior: remove a random item
+                # In a more advanced implementation, this would use a proper LRU algorithm
+                self.token_cache.pop(next(iter(self.token_cache)))
+        
+        # Combine cached and newly tokenized inputs
+        return self._combine_tokenized_inputs(cached_results, batch_size)
+    
+    def _combine_tokenized_inputs(self, tokenized_inputs, batch_size):
+        """
+        Combine multiple tokenized inputs into a single batch.
+        
+        Args:
+            tokenized_inputs: List of tokenized inputs
+            batch_size: The total batch size
+            
+        Returns:
+            combined_inputs: Combined tokenized inputs
+        """
+        # Initialize the result with the first input
+        result = {k: [] for k in tokenized_inputs[0].keys()}
+        
+        # Combine all inputs
+        for inputs in tokenized_inputs:
+            for k, v in inputs.items():
+                result[k].append(v)
+        
+        # Concatenate tensors
+        for k, v in result.items():
+            result[k] = torch.cat(v, dim=0)
+        
+        return result
     
     def edit_until_convergence(self, texts, sample=False, temperature=1.0):
         """
@@ -58,16 +156,28 @@ class RecursiveEditor:
         current_texts = texts.copy()
         edit_traces = [[] for _ in range(batch_size)]
         
+        # Track which examples have converged
+        converged_mask = [False] * batch_size
+        final_texts = current_texts.copy()
+        
         for iteration in range(self.max_iterations):
-            # Tokenize the current texts
-            inputs = self.tokenizer(
-                current_texts,
-                return_tensors="pt",
-                padding=True,
+            # Filter out converged examples
+            active_indices = [i for i, converged in enumerate(converged_mask) if not converged]
+            
+            # If all examples have converged, we're done
+            if not active_indices:
+                break
+                
+            # Process only non-converged examples
+            active_texts = [current_texts[i] for i in active_indices]
+            
+            # Use cached tokenization
+            inputs = self._cached_tokenize(
+                active_texts,
                 truncation=True,
                 return_attention_mask=True,
                 return_token_type_ids=True,
-            ).to(self.editor_model.device)
+            )
             
             # Predict edit operations
             with torch.no_grad():
@@ -82,8 +192,8 @@ class RecursiveEditor:
                 )
             
             # Apply edit operations
-            new_texts, batch_edit_traces = self._apply_edit_operations(
-                current_texts,
+            new_active_texts, active_batch_edit_traces = self._apply_edit_operations(
+                active_texts,
                 inputs["input_ids"],
                 operations,
                 replacements,
@@ -93,22 +203,28 @@ class RecursiveEditor:
                 split_probs,
             )
             
-            # Update edit traces
-            for i in range(batch_size):
-                edit_traces[i].append(batch_edit_traces[i])
+            # Check for convergence of active examples
+            active_converged = self._check_convergence(operations, inputs["attention_mask"])
             
-            # Check for convergence
-            converged = self._check_convergence(operations, inputs["attention_mask"])
-            if all(converged):
-                break
-            
-            # Update current texts
-            current_texts = new_texts
+            # Update texts, traces, and convergence status for active examples
+            for idx, active_idx in enumerate(active_indices):
+                # Update edit traces
+                edit_traces[active_idx].append(active_batch_edit_traces[idx])
+                
+                # Update current texts
+                current_texts[active_idx] = new_active_texts[idx]
+                
+                # Update final texts
+                final_texts[active_idx] = new_active_texts[idx]
+                
+                # Update convergence status
+                if active_converged[idx]:
+                    converged_mask[active_idx] = True
         
         if single_input:
-            return current_texts[0], edit_traces[0]
+            return final_texts[0], edit_traces[0]
         else:
-            return current_texts, edit_traces
+            return final_texts, edit_traces
     
     def _apply_edit_operations(
         self,
@@ -215,25 +331,21 @@ class RecursiveEditor:
         Returns:
             converged: Boolean tensor indicating whether each example has converged
         """
-        batch_size = operations.shape[0]
-        converged = []
+        # Vectorized implementation
+        # Count the number of non-KEEP operations for each example
+        non_keep = (operations != EditOperation.KEEP.value).float() * attention_mask
         
-        for i in range(batch_size):
-            # Count the number of non-KEEP operations
-            non_keep = (operations[i] != EditOperation.KEEP.value).float()
-            
-            # Apply attention mask to ignore padding
-            non_keep = non_keep * attention_mask[i]
-            
-            # Count the number of tokens
-            num_tokens = attention_mask[i].sum().item()
-            
-            # Count the number of non-KEEP operations
-            num_non_keep = non_keep.sum().item()
-            
-            # Check if the fraction of KEEP operations is above the threshold
-            keep_fraction = 1.0 - (num_non_keep / num_tokens)
-            converged.append(keep_fraction >= self.convergence_threshold)
+        # Count the number of tokens for each example
+        num_tokens = attention_mask.sum(dim=1)
+        
+        # Count the number of non-KEEP operations for each example
+        num_non_keep = non_keep.sum(dim=1)
+        
+        # Calculate the fraction of KEEP operations for each example
+        keep_fraction = 1.0 - (num_non_keep / num_tokens)
+        
+        # Check if the fraction of KEEP operations is above the threshold
+        converged = (keep_fraction >= self.convergence_threshold).tolist()
         
         return converged
     
@@ -250,3 +362,60 @@ class RecursiveEditor:
             edit_traces: The edit traces for RL training
         """
         return self.edit_until_convergence(texts, sample=True, temperature=temperature)
+    
+    def get_cache_stats(self):
+        """
+        Get statistics about the tokenization cache.
+        
+        Returns:
+            stats: Dictionary containing cache statistics
+        """
+        total = self.cache_hits + self.cache_misses
+        hit_rate = self.cache_hits / total if total > 0 else 0.0
+        
+        return {
+            "cache_size": len(self.token_cache),
+            "max_cache_size": self.cache_size,
+            "cache_hits": self.cache_hits,
+            "cache_misses": self.cache_misses,
+            "hit_rate": hit_rate,
+        }
+    
+    def clear_cache(self):
+        """
+        Clear the tokenization cache.
+        
+        This can be useful for memory management or when switching between different tasks.
+        """
+        self.token_cache.clear()
+        # Optionally reset statistics
+        # self.cache_hits = 0
+        # self.cache_misses = 0
+    
+    def resize_cache(self, new_size):
+        """
+        Resize the tokenization cache.
+        
+        Args:
+            new_size: The new maximum size of the cache
+            
+        Returns:
+            removed_count: Number of items removed from the cache
+        """
+        if new_size >= len(self.token_cache):
+            # Cache doesn't need to be trimmed
+            self.cache_size = new_size
+            return 0
+        
+        # Calculate how many items to remove
+        to_remove = len(self.token_cache) - new_size
+        
+        # Remove oldest items (in a more advanced implementation, this would use a proper LRU algorithm)
+        for _ in range(to_remove):
+            if self.token_cache:
+                self.token_cache.pop(next(iter(self.token_cache)))
+        
+        # Update cache size
+        self.cache_size = new_size
+        
+        return to_remove
