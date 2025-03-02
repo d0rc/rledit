@@ -73,6 +73,35 @@ class BERTEditor(PreTrainedModel):
         
         return model
     
+    def _prepare_encoder_inputs(self, input_ids, attention_mask, token_type_ids, position_ids,
+                          head_mask, inputs_embeds, output_attentions, output_hidden_states,
+                          return_dict):
+        # Create base parameters that work with all versions
+        params = {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'position_ids': position_ids,
+            'inputs_embeds': inputs_embeds,
+            'output_attentions': output_attentions,
+            'output_hidden_states': output_hidden_states,
+            'return_dict': return_dict
+        }
+        
+        # Only include token_type_ids, head_mask if explicitly provided and model supports it
+        if token_type_ids is not None:
+            try:
+                # Try including token_type_ids
+                params['token_type_ids'] = token_type_ids
+                params['head_mask'] = head_mask
+                # Verify model accepts this parameter
+                self.encoder.forward(**params)
+                return params
+            except TypeError:
+                # If TypeError occurs, model doesn't support token_type_ids
+                pass
+        
+        return params
+    
     def forward(
         self,
         input_ids=None,
@@ -105,7 +134,7 @@ class BERTEditor(PreTrainedModel):
             A dictionary containing the model outputs
         """
         # Run the encoder
-        encoder_outputs = self.encoder(
+        encoder_outputs = self.encoder(**self._prepare_encoder_inputs(
             input_ids=input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
@@ -115,7 +144,7 @@ class BERTEditor(PreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-        )
+        ))
         
         # Get the hidden states
         hidden_states = encoder_outputs[0]
