@@ -281,46 +281,51 @@ class RLTrainer:
         Returns:
             The policy gradient loss
         """
-        # Initialize the loss
-        loss = 0.0
+        # Pre-allocate lists to collect all probabilities and their associated rewards
+        all_probs = []
+        all_rewards = []
+        
+        # Precompute discount factors for efficiency (avoid repeated calculations)
+        max_iterations = max((len(trace) for trace in edit_traces), default=0)
+        discount_factors = torch.tensor(
+            [discount_factor ** i for i in range(max_iterations)],
+            device=self.device
+        )
         
         # Process each example
-        for trace, reward in zip(edit_traces, rewards):
+        for trace_idx, (trace, reward) in enumerate(zip(edit_traces, rewards)):
             # Process each iteration
             for i, iteration_trace in enumerate(trace):
-                # Compute the discounted reward
-                discounted_reward = reward * (discount_factor ** i)
+                # Get the precomputed discount factor
+                discounted_reward = reward * discount_factors[i].item()
                 
-                # Process each operation
+                # Collect all operation probabilities and their rewards
                 for op in iteration_trace:
-                    # Get the operation probability
-                    op_prob = op["probability"]
+                    # Add the operation probability
+                    all_probs.append(op["probability"])
+                    all_rewards.append(discounted_reward)
                     
-                    # Add the operation loss
-                    op_tensor = torch.tensor(op_prob, device=self.device, requires_grad=True)
-                    loss -= torch.log(op_tensor) * discounted_reward
-                    
-                    # Add the replacement loss if applicable
+                    # Add the replacement probability if applicable
                     if op["operation"] == "REPLACE" and "replacement_probability" in op:
-                        replacement_prob = op["replacement_probability"]
-                        replacement_tensor = torch.tensor(replacement_prob, device=self.device, requires_grad=True)
-                        loss -= torch.log(replacement_tensor) * discounted_reward
+                        all_probs.append(op["replacement_probability"])
+                        all_rewards.append(discounted_reward)
                     
-                    # Add the split loss if applicable
+                    # Add the split probabilities if applicable
                     if op["operation"] == "SPLIT" and "split_probabilities" in op:
-                        split_probs = op["split_probabilities"]
-                        for split_prob in split_probs:
-                            split_tensor = torch.tensor(split_prob, device=self.device, requires_grad=True)
-                            loss -= torch.log(split_tensor) * discounted_reward
+                        all_probs.extend(op["split_probabilities"])
+                        all_rewards.extend([discounted_reward] * len(op["split_probabilities"]))
         
-        # Normalize the loss
-        loss /= len(rewards)
+        # If no probabilities were collected, return zero loss
+        if not all_probs:
+            return torch.zeros(1, device=self.device, requires_grad=True)
         
-        # Ensure loss is a tensor with requires_grad=True
-        if not isinstance(loss, torch.Tensor):
-            # If loss is still a float (e.g., when no operations were performed),
-            # convert it to a zero tensor with requires_grad=True
-            loss = torch.zeros(1, device=self.device, requires_grad=True)
+        # Convert collected data to tensors ONCE (not in a loop)
+        prob_tensor = torch.tensor(all_probs, device=self.device, requires_grad=True)
+        reward_tensor = torch.tensor(all_rewards, device=self.device)
+        
+        # Compute loss in a vectorized way
+        log_probs = torch.log(prob_tensor)
+        loss = -torch.sum(log_probs * reward_tensor) / len(rewards)
         
         return loss
     
