@@ -57,6 +57,35 @@ def parse_args():
         help="Temperature for sampling",
     )
     
+    # Performance optimization arguments
+    parser.add_argument(
+        "--use_token_ids",
+        action="store_true",
+        help="Use token IDs directly instead of text for better performance",
+    )
+    parser.add_argument(
+        "--cache_size",
+        type=int,
+        default=1000,
+        help="Size of the tokenization cache (0 to disable)",
+    )
+    parser.add_argument(
+        "--early_stopping",
+        action="store_true",
+        help="Stop processing examples that have already converged",
+    )
+    parser.add_argument(
+        "--max_batch_size",
+        type=int,
+        default=None,
+        help="Maximum batch size to process at once (for memory constraints)",
+    )
+    parser.add_argument(
+        "--use_tqdm",
+        action="store_true",
+        help="Show progress bar during editing",
+    )
+    
     # Input arguments
     parser.add_argument(
         "--input_text",
@@ -140,6 +169,7 @@ def create_recursive_editor(model, tokenizer, args):
         tokenizer=tokenizer,
         max_iterations=args.max_iterations,
         convergence_threshold=args.convergence_threshold,
+        cache_size=args.cache_size,
     )
 
 
@@ -192,11 +222,39 @@ def main():
     
     # Edit the text
     logger.info("Editing text")
-    edited_text, edit_trace = recursive_editor.edit_until_convergence(
-        input_text,
-        sample=True,
-        temperature=args.temperature,
-    )
+    if args.use_token_ids:
+        logger.info("Using token IDs directly for better performance")
+        # Tokenize the text
+        inputs = tokenizer(
+            input_text,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            return_attention_mask=True,
+        ).to(args.device)
+        
+        # Edit the text using token IDs
+        edited_text, edit_trace = recursive_editor.edit_until_convergence(
+            inputs["input_ids"],
+            sample=True,
+            temperature=args.temperature,
+            inputs_are_tokenized=True,
+            attention_mask=inputs["attention_mask"],
+            return_as_ids=False,
+            early_stopping=args.early_stopping,
+            max_batch_size=args.max_batch_size,
+            use_tqdm=args.use_tqdm,
+        )
+    else:
+        # Edit the text using the text interface
+        edited_text, edit_trace = recursive_editor.edit_until_convergence(
+            input_text,
+            sample=True,
+            temperature=args.temperature,
+            early_stopping=args.early_stopping,
+            max_batch_size=args.max_batch_size,
+            use_tqdm=args.use_tqdm,
+        )
     
     # Log the results
     log_example(logger, input_text, edited_text)

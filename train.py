@@ -209,6 +209,35 @@ def parse_args():
         help="Weight for the efficiency bonus",
     )
     
+    # Performance optimization arguments
+    parser.add_argument(
+        "--use_token_ids",
+        action="store_true",
+        help="Use token IDs directly instead of text for better performance",
+    )
+    parser.add_argument(
+        "--cache_size",
+        type=int,
+        default=1000,
+        help="Size of the tokenization cache (0 to disable)",
+    )
+    parser.add_argument(
+        "--early_stopping",
+        action="store_true",
+        help="Stop processing examples that have already converged",
+    )
+    parser.add_argument(
+        "--max_batch_size",
+        type=int,
+        default=None,
+        help="Maximum batch size to process at once (for memory constraints)",
+    )
+    parser.add_argument(
+        "--use_tqdm",
+        action="store_true",
+        help="Show progress bar during training",
+    )
+    
     # Device arguments
     parser.add_argument(
         "--device",
@@ -452,10 +481,13 @@ def main():
     
     # Train the model
     logger.info("Training model")
+    if args.use_token_ids:
+        logger.info("Using token IDs directly for better performance")
     trainer.train(
         train_dataloader=train_dataloader,
         eval_dataloader=eval_dataloader,
         num_epochs=args.num_train_epochs,
+        use_token_ids=args.use_token_ids,
     )
     
     # Save the final model

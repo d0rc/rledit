@@ -59,6 +59,7 @@ class RLTrainer:
             tokenizer=self.tokenizer,
             max_iterations=self.config.get("max_iterations", 5),
             convergence_threshold=self.config.get("convergence_threshold", 0.95),
+            cache_size=self.config.get("cache_size", 1000),
         )
         
         # Create the optimizer
@@ -83,7 +84,7 @@ class RLTrainer:
         self.best_reward = float("-inf")
         self.best_model_path = None
     
-    def train(self, train_dataloader, eval_dataloader=None, num_epochs=1):
+    def train(self, train_dataloader, eval_dataloader=None, num_epochs=1, use_token_ids=True):
         """
         Train the model using reinforcement learning.
         
@@ -91,6 +92,7 @@ class RLTrainer:
             train_dataloader: The training data loader
             eval_dataloader: The evaluation data loader
             num_epochs: The number of epochs to train for
+            use_token_ids: Whether to use token IDs directly instead of text
             
         Returns:
             The trained model
@@ -120,11 +122,31 @@ class RLTrainer:
                 if token_type_ids is not None:
                     token_type_ids = token_type_ids.to(self.device)
                 
-                # Run the recursive editor with action sampling
-                edited_texts, edit_traces = self.recursive_editor.edit_with_sampling(
-                    original_texts,
-                    temperature=self.config.get("temperature", 1.0),
-                )
+                if use_token_ids:
+                    # Run the recursive editor with action sampling using token IDs directly
+                    edited_ids, edit_traces = self.recursive_editor.edit_with_sampling(
+                        input_ids,
+                        temperature=self.config.get("temperature", 1.0),
+                        inputs_are_tokenized=True,
+                        attention_mask=attention_mask,
+                        token_type_ids=token_type_ids,
+                        return_as_ids=True,
+                        early_stopping=self.config.get("early_stopping", True),
+                        max_batch_size=self.config.get("max_batch_size", None),
+                        use_tqdm=self.config.get("use_tqdm", False),
+                    )
+                    
+                    # Convert edited IDs to text for reward computation
+                    edited_texts = self.tokenizer.batch_decode(edited_ids, skip_special_tokens=True)
+                else:
+                    # Run the recursive editor with action sampling using text
+                    edited_texts, edit_traces = self.recursive_editor.edit_with_sampling(
+                        original_texts,
+                        temperature=self.config.get("temperature", 1.0),
+                        early_stopping=self.config.get("early_stopping", True),
+                        max_batch_size=self.config.get("max_batch_size", None),
+                        use_tqdm=self.config.get("use_tqdm", False),
+                    )
                 
                 # Compute rewards
                 rewards = self.environment.compute_batch_rewards(
@@ -169,7 +191,7 @@ class RLTrainer:
                 
                 # Evaluate periodically
                 if eval_dataloader is not None and self.global_step % self.config.get("eval_steps", 1000) == 0:
-                    eval_reward = self.evaluate(eval_dataloader)
+                    eval_reward = self.evaluate(eval_dataloader, use_token_ids=use_token_ids)
                     self.writer.add_scalar("Reward/eval", eval_reward, self.global_step)
                     
                     # Save the best model
@@ -199,7 +221,7 @@ class RLTrainer:
             
             # Evaluate at the end of each epoch
             if eval_dataloader is not None:
-                eval_reward = self.evaluate(eval_dataloader)
+                eval_reward = self.evaluate(eval_dataloader, use_token_ids=use_token_ids)
                 print(f"Evaluation Reward: {eval_reward:.4f}")
                 self.writer.add_scalar("Reward/eval", eval_reward, self.global_step)
                 
@@ -224,12 +246,13 @@ class RLTrainer:
         
         return self.editor_model
     
-    def evaluate(self, eval_dataloader):
+    def evaluate(self, eval_dataloader, use_token_ids=True):
         """
         Evaluate the model.
         
         Args:
             eval_dataloader: The evaluation data loader
+            use_token_ids: Whether to use token IDs directly instead of text
             
         Returns:
             The average reward
@@ -246,11 +269,38 @@ class RLTrainer:
                 # Extract the batch data
                 original_texts = batch["original_texts"]
                 
-                # Run the recursive editor
-                edited_texts, edit_traces = self.recursive_editor.edit_until_convergence(
-                    original_texts,
-                    sample=False,
-                )
+                # Move the batch to the device
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                token_type_ids = batch.get("token_type_ids", None)
+                if token_type_ids is not None:
+                    token_type_ids = token_type_ids.to(self.device)
+                
+                if use_token_ids:
+                    # Run the recursive editor using token IDs directly
+                    edited_ids, edit_traces = self.recursive_editor.edit_until_convergence(
+                        input_ids,
+                        sample=False,
+                        inputs_are_tokenized=True,
+                        attention_mask=attention_mask,
+                        token_type_ids=token_type_ids,
+                        return_as_ids=True,
+                        early_stopping=self.config.get("early_stopping", True),
+                        max_batch_size=self.config.get("max_batch_size", None),
+                        use_tqdm=self.config.get("use_tqdm", False),
+                    )
+                    
+                    # Convert edited IDs to text for reward computation
+                    edited_texts = self.tokenizer.batch_decode(edited_ids, skip_special_tokens=True)
+                else:
+                    # Run the recursive editor using text
+                    edited_texts, edit_traces = self.recursive_editor.edit_until_convergence(
+                        original_texts,
+                        sample=False,
+                        early_stopping=self.config.get("early_stopping", True),
+                        max_batch_size=self.config.get("max_batch_size", None),
+                        use_tqdm=self.config.get("use_tqdm", False),
+                    )
                 
                 # Compute rewards
                 rewards = self.environment.compute_batch_rewards(
